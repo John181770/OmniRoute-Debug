@@ -1614,7 +1614,40 @@ export function createSSEStream(options: StreamOptions = {}) {
                     return;
                   }
                   updateClaudeEmptyResponseLifecycle(claudeEmptyResponseLifecycle, parsed);
-                  const restoredToolName = restoreClaudePassthroughToolUseName(parsed, toolNameMap);
+                  // ============================================================================
+// DEBUG: Claude MCP tool-name restoration
+// Remove after debugging
+// ============================================================================
+if (parsed?.content_block?.type === "tool_use") {
+  console.log("\n================ TOOL USE DEBUG ================");
+  console.log("Incoming tool:", parsed.content_block.name);
+
+  console.log("toolNameMap is Map:", toolNameMap instanceof Map);
+
+  if (toolNameMap instanceof Map) {
+    console.log("Map size:", toolNameMap.size);
+
+    const restored = toolNameMap.get(parsed.content_block.name);
+    console.log("Lookup result:", restored);
+
+    console.log("----- toolNameMap entries -----");
+    for (const [sanitized, original] of toolNameMap.entries()) {
+      console.log(`${sanitized}  --->  ${original}`);
+    }
+    console.log("----- end toolNameMap -----");
+  } else {
+    console.log("toolNameMap value:", toolNameMap);
+  }
+}
+
+const restoredToolName =
+  restoreClaudePassthroughToolUseName(parsed, toolNameMap);
+
+if (parsed?.content_block?.type === "tool_use") {
+  console.log("restoreClaudePassthroughToolUseName returned:", restoredToolName);
+  console.log("Outgoing tool:", parsed.content_block.name);
+  console.log("===============================================\n");
+}
                   // Track content length and accumulate from Claude format
                   if (parsed.delta?.text) {
                     totalContentLength += parsed.delta.text.length;
