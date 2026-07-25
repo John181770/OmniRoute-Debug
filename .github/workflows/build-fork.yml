@@ -13,12 +13,12 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: ghcr.io/kang-heewon/omniroute
+  IMAGE_NAME: ghcr.io/john181770/omniroute
 
 jobs:
   build:
     name: Build and Push Fork Image
-    if: github.repository == 'kang-heewon/OmniRoute'
+    if: github.repository == 'John181770/OmniRoute-Debug'
     runs-on: ubuntu-latest
     permissions:
       contents: read
