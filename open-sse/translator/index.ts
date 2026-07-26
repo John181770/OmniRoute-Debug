@@ -20,6 +20,11 @@ import {
   injectOptionalEnumOmissionForTools,
   sanitizeToolDescriptions,
 } from "./helpers/schemaCoercion.ts";
+import {
+  detectRequiredTools,
+  cleanEmptyFields,
+  mergeSystemPrompts,
+} from "./helpers/toolOptimizer.ts";
 import { getRequestTranslator, getResponseTranslator } from "./registry.ts";
 import { bootstrapTranslatorRegistry } from "./bootstrap.ts";
 import { hasThinkingConfig, normalizeThinkingConfig } from "../services/provider.ts";
@@ -397,11 +402,19 @@ export function translateRequest(
     );
   }
 
-  if (result.tools !== undefined) {
-    result.tools = coerceToolSchemas(result.tools);
-    result.tools = sanitizeToolDescriptions(result.tools);
-    if (targetFormat === FORMATS.OPENAI_RESPONSES) {
-      result.tools = injectOptionalEnumOmissionForTools(result.tools);
+  if (result.tools !== undefined && Array.isArray(result.tools) && result.tools.length > 0) {
+    result.tools = detectRequiredTools(
+      (result.messages as Record<string, unknown>[]) || [],
+      result.tools as Record<string, unknown>[],
+      result.tool_choice
+    );
+    cleanEmptyFields(result);
+    if (result.tools !== undefined) {
+      result.tools = coerceToolSchemas(result.tools);
+      result.tools = sanitizeToolDescriptions(result.tools);
+      if (targetFormat === FORMATS.OPENAI_RESPONSES) {
+        result.tools = injectOptionalEnumOmissionForTools(result.tools);
+      }
     }
   }
 
@@ -565,6 +578,11 @@ export function translateRequest(
       }
     }
   }
+
+  if (result.messages && Array.isArray(result.messages)) {
+    result.messages = mergeSystemPrompts(result.messages);
+  }
+  cleanEmptyFields(result);
 
   return result;
 }

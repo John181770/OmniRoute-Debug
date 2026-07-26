@@ -220,6 +220,45 @@ describe("Tool Request Token Usage Optimizer", () => {
     assert.ok(logs.some((l) => l.startsWith("Approx Tokens:")));
   });
 
+  it("Task 5 Verification — Tool counts across request intents", () => {
+    // Normal Chat (general questions / text without tool trigger keywords)
+    const normal1 = detectRequiredTools(
+      [{ role: "user", content: "What is the capital of France?" }],
+      sampleTools
+    );
+    assert.equal(normal1.length, 0, "Normal chat prompt should yield 0 tools");
+
+    const normal2 = detectRequiredTools(
+      [{ role: "user", content: "Tell me a funny joke about programming" }],
+      sampleTools
+    );
+    assert.equal(normal2.length, 0, "Normal chat prompt should yield 0 tools");
+
+    // Web Search
+    const search = detectRequiredTools(
+      [{ role: "user", content: "Search Google for weather in Tokyo" }],
+      sampleTools
+    );
+    assert.equal(search.length, 1, "Web search should yield 1 tool");
+    assert.equal(search[0].function.name, "web_search");
+
+    // OCR
+    const ocr = detectRequiredTools(
+      [{ role: "user", content: "OCR this image for text" }],
+      sampleTools
+    );
+    assert.ok(ocr.length >= 1 && ocr.length <= 3, "OCR should yield 1 to 3 tools");
+    assert.equal(ocr[0].function.name, "ocr");
+
+    // Image Generation
+    const imageGen = detectRequiredTools(
+      [{ role: "user", content: "Generate an image of a red cat" }],
+      sampleTools
+    );
+    assert.equal(imageGen.length, 1, "Image generation should yield 1 tool");
+    assert.equal(imageGen[0].function.name, "image_generation");
+  });
+
   it("Full Translator Test — Normal Chat keeps System: 1, Tools: 0, Token Count low", () => {
     const input = {
       model: "claude-3-7-sonnet",

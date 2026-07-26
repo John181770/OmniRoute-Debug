@@ -212,12 +212,12 @@ export function detectRequiredTools(
         for (const tc of msg.tool_calls as JsonRecord[]) {
           const fn = tc.function as JsonRecord | undefined;
           if (fn?.name && typeof fn.name === "string") {
-            historicalToolNames.add(fn.name);
+            historicalToolNames.add(fn.name.toLowerCase());
           }
         }
       }
       if (msg.role === "tool" || msg.type === "tool_result") {
-        if (typeof msg.name === "string") historicalToolNames.add(msg.name);
+        if (typeof msg.name === "string") historicalToolNames.add(msg.name.toLowerCase());
       }
       if (typeof msg.content === "string") {
         textParts.push(msg.content);
@@ -253,39 +253,112 @@ export function detectRequiredTools(
   }
 
   const required: JsonRecord[] = [];
+  const genericStopWords = new Set([
+    "the",
+    "get",
+    "set",
+    "read",
+    "write",
+    "file",
+    "tool",
+    "data",
+    "info",
+    "user",
+    "list",
+    "show",
+    "make",
+    "call",
+    "help",
+    "view",
+    "save",
+    "load",
+    "type",
+    "mode",
+    "path",
+    "name",
+    "code",
+    "lang",
+    "time",
+    "date",
+    "item",
+    "text",
+    "page",
+    "site",
+    "link",
+    "node",
+    "post",
+    "send",
+    "push",
+    "pull",
+    "proxy",
+    "exec",
+    "run",
+    "main",
+    "temp",
+    "test",
+    "find",
+    "ask",
+    "query",
+    "check",
+    "with",
+    "from",
+    "that",
+    "this",
+    "have",
+    "more",
+    "some",
+    "your",
+    "what",
+    "which",
+    "when",
+    "where",
+    "how",
+  ]);
 
   for (const tool of dedupped) {
     const fn = (tool.function as JsonRecord) || tool;
-    const name =
+    const rawName =
       typeof fn.name === "string"
-        ? fn.name.toLowerCase()
+        ? fn.name
         : typeof tool.name === "string"
-          ? tool.name.toLowerCase()
+          ? tool.name
           : typeof tool.type === "string"
-            ? tool.type.toLowerCase()
+            ? tool.type
             : "";
-    const desc = typeof fn.description === "string" ? fn.description.toLowerCase() : "";
+    const name = rawName.toLowerCase();
+    const cleanName = name.replace(/^proxy_/, "").replace(/^mcp__.*?__/, "");
 
     // 1. Tool used in historical conversation turn
-    if (name && historicalToolNames.has(name)) {
-      required.push(tool);
-      continue;
-    }
-
-    // 2. Direct tool name match or sub-token match
     if (
       name &&
-      (combinedText.includes(name) ||
-        name.split("_").every((k) => k.length > 2 && combinedText.includes(k)))
+      (historicalToolNames.has(name) ||
+        historicalToolNames.has(cleanName) ||
+        historicalToolNames.has(rawName))
     ) {
       required.push(tool);
       continue;
     }
 
-    // 3. Domain / Intent match (Search Google, Generate image, Read PDF, OCR image, code execution)
+    // 2. Direct exact tool name match in user text / combined text
+    if (cleanName && cleanName.length >= 3) {
+      const namePattern = new RegExp(
+        `\\b${cleanName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`,
+        "i"
+      );
+      if (namePattern.test(combinedText)) {
+        required.push(tool);
+        continue;
+      }
+    }
+
+    // 3. Domain / Intent match with specific intent regexes
     let isMatch = false;
 
-    if (name.includes("search") || name.includes("google") || name === "web_search") {
+    if (
+      cleanName.includes("search") ||
+      cleanName.includes("google") ||
+      cleanName === "web_search"
+    ) {
       if (
         /\b(search|google|lookup|find.*online|browse|web|website|url|http|https|news|latest|weather)\b/i.test(
           combinedText
@@ -294,46 +367,64 @@ export function detectRequiredTools(
         isMatch = true;
       }
     } else if (
-      name.includes("image_generation") ||
-      name.includes("image") ||
-      name.includes("draw") ||
-      name.includes("dall")
+      cleanName.includes("image_generation") ||
+      cleanName.includes("draw") ||
+      cleanName.includes("dall") ||
+      cleanName.includes("generate_image") ||
+      cleanName.includes("create_image")
     ) {
-      if (
-        /\b(image|picture|photo|illustration|draw|render|generate.*image|create.*image)\b/i.test(
-          combinedText
-        )
-      ) {
-        isMatch = true;
+      if (!/\b(ocr|extract.*text)\b/i.test(combinedText)) {
+        if (
+          /\b(draw|render|generate.*image|create.*image|picture\s+of|photo\s+of|illustration\s+of|dall-?e)\b/i.test(
+            combinedText
+          ) ||
+          (/\b(image|picture|photo|illustration)\b/i.test(combinedText) &&
+            /\b(generate|create|draw|render|make|produce)\b/i.test(combinedText))
+        ) {
+          isMatch = true;
+        }
       }
     } else if (
-      name.includes("file_reader") ||
-      name.includes("pdf") ||
-      name.includes("read") ||
-      name.includes("doc")
+      cleanName.includes("file_reader") ||
+      cleanName.includes("pdf") ||
+      cleanName.includes("read_file") ||
+      cleanName.includes("doc_reader")
     ) {
       if (
         /\b(file|pdf|document|attachment|open.*file|read.*pdf|read.*file)\b/i.test(combinedText)
       ) {
         isMatch = true;
       }
-    } else if (name.includes("ocr") || (name.includes("image") && combinedText.includes("ocr"))) {
-      if (/\b(ocr|extract.*text|image.*text|read.*image)\b/i.test(combinedText)) {
+    } else if (
+      cleanName.includes("ocr") ||
+      (cleanName.includes("image") && combinedText.includes("ocr"))
+    ) {
+      if (
+        /\b(ocr|extract.*text|image.*text|read.*image|text.*image|scan.*text)\b/i.test(combinedText)
+      ) {
         isMatch = true;
       }
     } else if (
-      name.includes("code") ||
-      name.includes("python") ||
-      name.includes("bash") ||
-      name.includes("terminal") ||
-      name.includes("exec")
+      cleanName.includes("code_execution") ||
+      cleanName.includes("python") ||
+      cleanName.includes("bash") ||
+      cleanName.includes("terminal") ||
+      cleanName.includes("run_command")
     ) {
-      if (/\b(code|python|bash|terminal|script|execute|run)\b/i.test(combinedText)) {
+      if (
+        /\b(code|python|bash|terminal|script|execute|run.*command|run.*script)\b/i.test(
+          combinedText
+        )
+      ) {
         isMatch = true;
       }
-    } else if (desc) {
-      const keywords = name.split(/[\s_-]+/).filter((k) => k.length > 2);
-      if (keywords.length > 0 && keywords.some((k) => combinedText.includes(k))) {
+    } else {
+      // 4. Strict multi-token match for custom/other tools:
+      // Require specific non-generic tokens (length >= 4 and not generic stop words) to match.
+      const tokens = cleanName
+        .split(/[\s_-]+/)
+        .filter((k) => k.length >= 4 && !genericStopWords.has(k));
+      if (tokens.length > 0 && tokens.every((k) => combinedText.includes(k))) {
         isMatch = true;
       }
     }
@@ -343,7 +434,42 @@ export function detectRequiredTools(
     }
   }
 
-  return required;
+  // Post-process matches to enforce tool count caps per category:
+  // Web search: <= 1
+  // Image gen: <= 1
+  // PDF: <= 1
+  // OCR: <= 2
+  const finalTools: JsonRecord[] = [];
+  const categoryCounts = new Map<string, number>();
+
+  for (const t of required) {
+    const fn = (t.function as JsonRecord) || t;
+    const rawName =
+      typeof fn.name === "string"
+        ? fn.name
+        : typeof t.name === "string"
+          ? t.name
+          : typeof t.type === "string"
+            ? t.type
+            : "";
+    const name = rawName.toLowerCase();
+    let cat = "other";
+    if (name.includes("search") || name.includes("google") || name === "web_search") cat = "search";
+    else if (name.includes("image_generation") || name.includes("draw") || name.includes("dall"))
+      cat = "image";
+    else if (name.includes("pdf") || name.includes("file_reader")) cat = "pdf";
+    else if (name.includes("ocr")) cat = "ocr";
+
+    const maxLimit =
+      cat === "search" ? 1 : cat === "image" ? 1 : cat === "pdf" ? 1 : cat === "ocr" ? 2 : Infinity;
+    const count = categoryCounts.get(cat) || 0;
+    if (count < maxLimit) {
+      categoryCounts.set(cat, count + 1);
+      finalTools.push(t);
+    }
+  }
+
+  return finalTools;
 }
 
 /**
@@ -431,6 +557,29 @@ export function cleanEmptyFields(result: JsonRecord): void {
   ) {
     delete result.response_format;
   }
+
+  // Scrub null, undefined, empty arrays, and empty objects
+  for (const [key, val] of Object.entries(result)) {
+    if (val === null || val === undefined) {
+      delete result[key];
+    } else if (
+      Array.isArray(val) &&
+      val.length === 0 &&
+      key !== "messages" &&
+      key !== "input" &&
+      key !== "contents"
+    ) {
+      delete result[key];
+    } else if (
+      val &&
+      typeof val === "object" &&
+      !Array.isArray(val) &&
+      Object.keys(val as object).length === 0 &&
+      key !== "response_format"
+    ) {
+      delete result[key];
+    }
+  }
 }
 
 /**
@@ -448,6 +597,16 @@ export function logPayloadStats(result: JsonRecord): void {
 
   const tools = Array.isArray(result.tools) ? result.tools : [];
   const toolCount = tools.length;
+  const toolNames = tools.map((t) => {
+    const fn = (t.function as JsonRecord) || t;
+    return typeof fn.name === "string"
+      ? fn.name
+      : typeof t.name === "string"
+        ? t.name
+        : typeof t.type === "string"
+          ? t.type
+          : "unknown";
+  });
   const messages = Array.isArray(result.messages) ? result.messages : [];
   const payloadStr = JSON.stringify(result);
   const payloadLen = payloadStr.length;
@@ -456,6 +615,11 @@ export function logPayloadStats(result: JsonRecord): void {
   console.log("===== Payload Stats =====");
   console.log("System:", systemCount);
   console.log("Tools:", toolCount);
+  if (toolNames.length > 0) {
+    console.log("Selected Tools:", toolNames.join(", "));
+  } else {
+    console.log("Selected Tools: none");
+  }
   console.log("Messages:", messages.length);
   console.log("Payload:", payloadLen);
   console.log("Approx Tokens:", approxTokens);
