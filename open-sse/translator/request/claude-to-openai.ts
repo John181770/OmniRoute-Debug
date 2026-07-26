@@ -90,6 +90,225 @@ function shouldUseNativeResponsesWebSearch(credentials: unknown): boolean {
   );
 }
 
+function compressToolDescription(desc: unknown): string {
+  if (typeof desc !== "string" || !desc.trim()) return "";
+  const firstLine = desc.split("\n")[0].trim();
+  const cleaned = firstLine.replace(
+    /^(this tool allows you to|use this tool to|a tool to)\s+/i,
+    ""
+  );
+  return cleaned.length > 120 ? cleaned.slice(0, 117) + "..." : cleaned;
+}
+
+function isNormalChat(userText: string): boolean {
+  if (!userText || !userText.trim()) return true;
+  const clean = userText
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s]/g, "");
+
+  const simpleGreetings = new Set([
+    "hi",
+    "hello",
+    "hey",
+    "thanks",
+    "thank you",
+    "thx",
+    "how are you",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "who are you",
+    "what is your name",
+    "what can you do",
+    "what is 22",
+    "ok",
+    "okay",
+    "bye",
+    "goodbye",
+    "yes",
+    "no",
+    "cool",
+    "nice",
+    "awesome",
+    "great",
+  ]);
+
+  if (simpleGreetings.has(clean)) return true;
+
+  const words = clean.split(/\s+/);
+  if (words.length <= 2) {
+    const greetingWords = new Set([
+      "hi",
+      "hello",
+      "hey",
+      "sup",
+      "yo",
+      "thanks",
+      "thank",
+      "you",
+      "good",
+      "morning",
+      "afternoon",
+      "evening",
+      "bye",
+      "ok",
+    ]);
+    if (words.every((w) => greetingWords.has(w))) return true;
+  }
+
+  return false;
+}
+
+function detectRequiredTools(
+  messages: JsonRecord[],
+  allTools: JsonRecord[],
+  toolChoice: unknown
+): JsonRecord[] {
+  if (!allTools || allTools.length === 0) return [];
+  if (allTools.length === 1 && toolChoice !== "none") return allTools;
+
+  // Check explicit tool_choice override
+  if (toolChoice) {
+    if (typeof toolChoice === "string") {
+      if (toolChoice === "none") return [];
+      if (toolChoice === "required" || toolChoice === TOOL_CHOICE_ANY) return allTools;
+    } else if (typeof toolChoice === "object" && toolChoice !== null) {
+      const choiceObj = toolChoice as JsonRecord;
+      let targetName = "";
+      if (typeof choiceObj.name === "string") targetName = choiceObj.name;
+      else if (choiceObj.function && typeof (choiceObj.function as JsonRecord).name === "string") {
+        targetName = (choiceObj.function as JsonRecord).name;
+      }
+      if (targetName) {
+        const matched = allTools.filter((t) => {
+          const fn = (t.function as JsonRecord) || t;
+          return fn?.name === targetName || t.name === targetName || t.type === targetName;
+        });
+        if (matched.length > 0) return matched;
+      }
+    }
+  }
+
+  // Gather historical tool call names and message text
+  const historicalToolNames = new Set<string>();
+  const textParts: string[] = [];
+
+  for (const msg of messages) {
+    if (Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls as JsonRecord[]) {
+        const fn = tc.function as JsonRecord | undefined;
+        if (fn?.name && typeof fn.name === "string") {
+          historicalToolNames.add(fn.name);
+        }
+      }
+    }
+    if (typeof msg.content === "string") {
+      textParts.push(msg.content);
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content as JsonRecord[]) {
+        if (part?.type === "text" && typeof part.text === "string") {
+          textParts.push(part.text);
+        }
+      }
+    }
+  }
+
+  const combinedText = textParts.join(" ").toLowerCase();
+  const latestUserMsg = [...messages].reverse().find((m) => m.role === "user");
+  let latestUserText = "";
+  if (latestUserMsg) {
+    if (typeof latestUserMsg.content === "string") {
+      latestUserText = latestUserMsg.content;
+    } else if (Array.isArray(latestUserMsg.content)) {
+      latestUserText = (latestUserMsg.content as JsonRecord[])
+        .filter((p) => p?.type === "text" && typeof p.text === "string")
+        .map((p) => p.text)
+        .join(" ");
+    }
+  }
+
+  // Task 3: Skip tools for normal chat if no historical tool calls are pending
+  if (isNormalChat(latestUserText) && historicalToolNames.size === 0) {
+    return [];
+  }
+
+  const required: JsonRecord[] = [];
+
+  for (const tool of allTools) {
+    const fn = (tool.function as JsonRecord) || tool;
+    const name =
+      typeof fn.name === "string"
+        ? fn.name.toLowerCase()
+        : typeof tool.type === "string"
+          ? tool.type.toLowerCase()
+          : "";
+    const desc = typeof fn.description === "string" ? fn.description.toLowerCase() : "";
+
+    // 1. Tool used in historical conversation turn
+    if (name && historicalToolNames.has(name)) {
+      required.push(tool);
+      continue;
+    }
+
+    // 2. Direct tool name match or sub-token match
+    if (
+      name &&
+      (combinedText.includes(name) ||
+        name.split("_").every((k) => k.length > 2 && combinedText.includes(k)))
+    ) {
+      required.push(tool);
+      continue;
+    }
+
+    // 3. Domain / Intent match
+    let isMatch = false;
+
+    if (name.includes("search") || name.includes("google") || name === "web_search") {
+      if (
+        /\b(search|google|lookup|find online|browse|web|website|url|http|https|news|latest|weather)\b/i.test(
+          combinedText
+        )
+      ) {
+        isMatch = true;
+      }
+    } else if (name.includes("image") || name.includes("draw") || name.includes("dall")) {
+      if (
+        /\b(generate image|create image|draw|picture|photo|illustration|render image|image)\b/i.test(
+          combinedText
+        )
+      ) {
+        isMatch = true;
+      }
+    } else if (name.includes("file") || name.includes("pdf") || name.includes("read")) {
+      if (/\b(file|pdf|read file|read pdf|document|attachment|open file)\b/i.test(combinedText)) {
+        isMatch = true;
+      }
+    } else if (
+      name.includes("code") ||
+      name.includes("python") ||
+      name.includes("bash") ||
+      name.includes("terminal") ||
+      name.includes("exec")
+    ) {
+      if (/\b(code|python|bash|terminal|script|execute|run)\b/i.test(combinedText)) {
+        isMatch = true;
+      }
+    } else if (desc) {
+      const keywords = name.split(/[\s_-]+/).filter((k) => k.length > 3);
+      if (keywords.some((k) => combinedText.includes(k))) {
+        isMatch = true;
+      }
+    }
+
+    if (isMatch) {
+      required.push(tool);
+    }
+  }
+
+  return required;
+}
+
 // Convert Claude request to OpenAI format
 export function claudeToOpenAIRequest(model, body, stream, credentials: unknown = null) {
   // #2069 — when the routed provider honors OpenAI-format cache_control breakpoints
@@ -129,17 +348,37 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
     result.stop = body.stop_sequences;
   }
 
-  // System message
+  // Task 4: Consolidate & Merge System Prompts (from body.system and body.messages)
+  const systemBlocks: unknown[] = [];
   if (body.system) {
+    if (Array.isArray(body.system)) systemBlocks.push(...body.system);
+    else systemBlocks.push(body.system);
+  }
+
+  // Extract mid-conversation system messages from body.messages
+  const nonSystemBodyMessages: JsonRecord[] = [];
+  if (body.messages && Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      if (msg && typeof msg === "object" && msg.role === "system") {
+        if (typeof msg.content === "string") systemBlocks.push(msg.content);
+        else if (Array.isArray(msg.content)) systemBlocks.push(...msg.content);
+      } else {
+        nonSystemBodyMessages.push(msg);
+      }
+    }
+  }
+
+  if (systemBlocks.length > 0) {
     const systemHasCacheControl =
       preserveCacheControl &&
-      Array.isArray(body.system) &&
-      body.system.some((s) => s && typeof s === "object" && s.cache_control !== undefined);
+      systemBlocks.some(
+        (s) => s && typeof s === "object" && (s as JsonRecord).cache_control !== undefined
+      );
 
     let systemContent: unknown;
     if (systemHasCacheControl) {
       const seenTexts = new Set<string>();
-      systemContent = body.system
+      systemContent = systemBlocks
         .map((s) => {
           if (typeof s === "string") {
             const text = stripAnthropicBillingHeader(s).trim();
@@ -159,18 +398,22 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
         })
         .filter(Boolean);
     } else {
-      const rawList = Array.isArray(body.system) ? body.system : [body.system];
-      const uniqueTexts: string[] = [];
+      const uniqueLines: string[] = [];
       const seen = new Set<string>();
-      for (const s of rawList) {
+      for (const s of systemBlocks) {
         const raw = typeof s === "string" ? s : s?.text || "";
         const cleaned = stripAnthropicBillingHeader(raw).trim();
-        if (cleaned && !seen.has(cleaned)) {
-          seen.add(cleaned);
-          uniqueTexts.push(cleaned);
+        if (!cleaned) continue;
+        const lines = cleaned.split("\n");
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (trimmedLine && !seen.has(trimmedLine)) {
+            seen.add(trimmedLine);
+            uniqueLines.push(trimmedLine);
+          }
         }
       }
-      systemContent = uniqueTexts.join("\n");
+      systemContent = uniqueLines.join("\n");
     }
 
     if (
@@ -187,17 +430,14 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
   }
 
   // Convert messages
-  if (body.messages && Array.isArray(body.messages)) {
-    for (let i = 0; i < body.messages.length; i++) {
-      const msg = body.messages[i];
-      const converted = convertClaudeMessage(msg, preserveCacheControl);
-      if (converted) {
-        // Handle array of messages (multiple tool results)
-        if (Array.isArray(converted)) {
-          result.messages.push(...converted);
-        } else {
-          result.messages.push(converted);
-        }
+  for (let i = 0; i < nonSystemBodyMessages.length; i++) {
+    const msg = nonSystemBodyMessages[i];
+    const converted = convertClaudeMessage(msg, preserveCacheControl);
+    if (converted) {
+      if (Array.isArray(converted)) {
+        result.messages.push(...converted);
+      } else {
+        result.messages.push(converted);
       }
     }
   }
@@ -220,10 +460,11 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
 
   const useNativeResponsesWebSearch = shouldUseNativeResponsesWebSearch(credentials);
 
-  // Tools
+  // Tools & Schema Compression (Task 2)
+  let normalizedTools: JsonRecord[] = [];
   if (body.tools && Array.isArray(body.tools)) {
     const seenToolNames = new Set<string>();
-    const normalizedTools = body.tools
+    normalizedTools = body.tools
       .map((tool) => {
         if (isClaudeServerWebSearchTool(tool)) {
           if (useNativeResponsesWebSearch) {
@@ -249,20 +490,22 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
           type: "function",
           function: {
             name,
-            description: typeof record.description === "string" ? record.description : "", // fix: never null (#276)
-            parameters: normalizeToolSchema(record.input_schema),
+            description: compressToolDescription(record.description),
+            parameters: coerceSchemaNumericFields(normalizeToolSchema(record.input_schema)),
           },
         };
       })
       .filter((tool): tool is JsonRecord => Boolean(tool));
+  }
 
-    if (normalizedTools.length > 0) {
-      result.tools = normalizedTools;
-    }
+  // Dynamic Tool Injection (Task 1 & Task 3)
+  const requiredTools = detectRequiredTools(result.messages, normalizedTools, body.tool_choice);
+  if (requiredTools.length > 0) {
+    result.tools = requiredTools;
   }
 
   // Tool choice
-  if (body.tool_choice) {
+  if (body.tool_choice && result.tools && Array.isArray(result.tools) && result.tools.length > 0) {
     result.tool_choice = convertToolChoice(
       body.tool_choice,
       useNativeResponsesWebSearch && hasClaudeServerWebSearchTool(body.tools)
@@ -290,20 +533,29 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
     }
   }
 
-  // Clean unused empty optional arrays/properties
-  if (Array.isArray(result.tools) && result.tools.length === 0) {
+  // Remove Empty Request Fields (Task 8 & Task 9)
+  if (!result.tools || (Array.isArray(result.tools) && result.tools.length === 0)) {
     delete result.tools;
+    delete result.tool_choice;
   }
-  if (Array.isArray(result.stop) && result.stop.length === 0) {
+  if (!result.tool_choice) {
+    delete result.tool_choice;
+  }
+  if (!result.stop || (Array.isArray(result.stop) && result.stop.length === 0)) {
     delete result.stop;
   }
 
   const payload = JSON.stringify(result);
 
-  console.log("\n===== OpenAI Payload Stats =====");
-  console.log("System Messages:", result.messages.filter((m) => m.role === "system").length);
-  console.log("Tools:", result.tools?.length ?? 0);
-  console.log("Payload Size:", payload.length, "bytes");
+  // Instrumentation (Task 10)
+  const systemCount = result.messages.filter((m) => m.role === "system").length;
+  const toolCount = Array.isArray(result.tools) ? (result.tools as unknown[]).length : 0;
+
+  console.log("\n===== Payload Stats =====");
+  console.log("System:", systemCount);
+  console.log("Tools:", toolCount);
+  console.log("Messages:", result.messages.length);
+  console.log("Payload:", payload.length);
   console.log("Approx Tokens:", Math.ceil(payload.length / 4));
   console.log("================================\n");
 
@@ -397,7 +649,10 @@ function mergeAdjacentAndRemoveEmpty(messages: JsonRecord[]): JsonRecord[] {
   const filtered: JsonRecord[] = [];
 
   for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
+    const msg = { ...messages[i] };
+    if (typeof msg.content === "string") {
+      msg.content = msg.content.replace(/\n{3,}/g, "\n\n");
+    }
     const isFinalAssistant = i === messages.length - 1 && msg.role === "assistant";
     const hasReasoning = "reasoning_content" in msg && msg.reasoning_content !== null;
     if (
@@ -416,6 +671,24 @@ function mergeAdjacentAndRemoveEmpty(messages: JsonRecord[]): JsonRecord[] {
   const merged: JsonRecord[] = [];
   for (const msg of filtered) {
     const prev = merged[merged.length - 1];
+
+    // Task 6: Remove duplicate adjacent messages with identical role and content
+    const prevReasoning = prev && "reasoning_content" in prev ? prev.reasoning_content : undefined;
+    const msgReasoning = "reasoning_content" in msg ? msg.reasoning_content : undefined;
+
+    if (
+      prev &&
+      prev.role === msg.role &&
+      !prev.tool_calls &&
+      !msg.tool_calls &&
+      !prev.tool_call_id &&
+      !msg.tool_call_id &&
+      prevReasoning === msgReasoning &&
+      JSON.stringify(prev.content) === JSON.stringify(msg.content)
+    ) {
+      continue;
+    }
+
     if (
       prev &&
       prev.role === "user" &&

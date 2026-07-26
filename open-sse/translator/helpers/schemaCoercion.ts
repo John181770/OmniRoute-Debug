@@ -86,7 +86,11 @@ export function coerceSchemaNumericFields(schema: unknown): unknown {
 
   const result: JsonRecord = { ...schema };
 
-  // Strip non-functional JSON Schema metadata fields to minimize payload token size
+  // Compress description to 1 line (max 100 chars) and strip non-functional JSON Schema metadata fields to minimize payload token size
+  if ("description" in result && typeof result.description === "string") {
+    const firstLine = result.description.split("\n")[0].trim();
+    result.description = firstLine.length > 100 ? firstLine.slice(0, 97) + "..." : firstLine;
+  }
   if ("title" in result) delete result.title;
   if ("$schema" in result) delete result.$schema;
   if ("$comment" in result) delete result.$comment;
