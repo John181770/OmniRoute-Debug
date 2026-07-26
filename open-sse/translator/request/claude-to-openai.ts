@@ -252,7 +252,16 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
     }
   }
 
-  return result;
+  const payload = JSON.stringify(result);
+
+console.log("\n===== OpenAI Payload Stats =====");
+console.log("System Messages:", result.messages.filter(m => m.role === "system").length);
+console.log("Tools:", result.tools?.length ?? 0);
+console.log("Payload Size:", payload.length, "bytes");
+console.log("Approx Tokens:", Math.ceil(payload.length / 4));
+console.log("================================\n");
+
+return result;
 }
 
 // #4714: Re-group tool result messages so every role:"tool" message sits
