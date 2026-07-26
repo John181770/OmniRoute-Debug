@@ -7,6 +7,15 @@
 import { isOpenAIResponsesStoreEnabled } from "@/lib/providers/requestDefaults";
 import { FORMATS } from "../formats.ts";
 import { register } from "../registry.ts";
+import {
+  compressToolDescription,
+  compressSchema,
+  deduplicateTools,
+  detectRequiredTools,
+  mergeSystemPrompts,
+  cleanEmptyFields,
+  logPayloadStats,
+} from "../helpers/toolOptimizer.ts";
 import { normalizeResponsesInputForChat } from "../../utils/responsesInputNormalization.ts";
 import {
   getRegisteredProviders,
@@ -747,6 +756,17 @@ export function openaiResponsesToOpenAIRequest(
       }
     }
   }
+
+  result.messages = mergeSystemPrompts(result.messages as JsonRecord[]);
+  if (Array.isArray(result.tools) && result.tools.length > 0) {
+    result.tools = detectRequiredTools(
+      result.messages as JsonRecord[],
+      result.tools as JsonRecord[],
+      result.tool_choice
+    );
+  }
+  cleanEmptyFields(result);
+  logPayloadStats(result);
 
   return result;
 }

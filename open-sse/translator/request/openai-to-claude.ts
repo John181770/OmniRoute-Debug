@@ -1,5 +1,14 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
+import {
+  compressToolDescription,
+  compressSchema,
+  deduplicateTools,
+  detectRequiredTools,
+  mergeSystemPrompts,
+  cleanEmptyFields,
+  logPayloadStats,
+} from "../helpers/toolOptimizer.ts";
 // CLAUDE_SYSTEM_PROMPT import removed — no longer injected unconditionally (#1966/#2130)
 import { supportsClaudeMaxEffort, supportsXHighEffort } from "../../config/providerModels.ts";
 import { adjustMaxTokens } from "../helpers/maxTokensHelper.ts";
@@ -370,16 +379,8 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
 
   // Tools - convert from OpenAI format to Claude format with prefix for OAuth
   if (body.tools && Array.isArray(body.tools)) {
-    result.tools = body.tools
+    const rawConverted = body.tools
       .map((tool) => {
-        // Function-shaped tools arrive in two flavors from real clients:
-        //   (a) openai-spec: { type: "function", function: { name, ... } }
-        //   (b) bare/loose:  { function: { name, ... } }   (no parent `type`)
-        // Unwrap `tool.function` whenever it is present, regardless of the
-        // parent `type` field — some OpenAI-shape clients omit the wrapper's
-        // `type: "function"` entirely. Previously that bare shape fell
-        // through to `toolData = tool` (the wrapper itself, with no `.name`),
-        // producing an empty `originalName` and silently dropping the tool.
         const toolData = tool.function ?? tool;
         const originalName = typeof toolData.name === "string" ? toolData.name.trim() : "";
 
@@ -387,41 +388,33 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
           return null;
         }
 
-        // Claude OAuth requires prefixed tool names to avoid conflicts
-        // When prefix is disabled (non-Claude backends), use original name
         const toolName = disableToolPrefix ? originalName : CLAUDE_OAUTH_TOOL_PREFIX + originalName;
 
-        // Store mapping for response translation (prefixed → original)
         if (!disableToolPrefix) {
           toolNameMap.set(toolName, originalName);
         }
 
-        // Normalize input_schema: Anthropic requires `properties` when type is "object" (#595).
-        // MCP tools (e.g. pencil, computer_use) may omit properties on object-type schemas.
         const rawSchema: Record<string, unknown> = toolData.parameters ||
           toolData.input_schema || { type: "object", properties: {}, required: [] };
-        const normalizedSchema =
-          rawSchema.type === "object" && !rawSchema.properties
-            ? { ...rawSchema, properties: {} }
-            : rawSchema;
+        const normalizedSchema = compressSchema(rawSchema);
 
         return {
           name: toolName,
-          description: toolData.description || "",
+          description: compressToolDescription(toolData.description),
           input_schema: normalizedSchema,
         };
       })
       .filter((tool): tool is ClaudeTool => Boolean(tool));
 
-    // Filter out tools with empty names (would cause Claude 400 error)
-    result.tools = result.tools.filter((tool) => tool.name && tool.name?.trim());
+    const dedupped = deduplicateTools(rawConverted as JsonRecord[]);
+    result.tools = detectRequiredTools(body.messages, dedupped, body.tool_choice) as ClaudeTool[];
 
-    // Cache breakpoint on the last non-defer-loading tool — Anthropic
-    // rejects cache_control on defer_loading tools.
-    for (let i = result.tools.length - 1; i >= 0; i--) {
-      if (!result.tools[i].defer_loading) {
-        result.tools[i].cache_control = { type: "ephemeral", ttl: "1h" };
-        break;
+    if (result.tools.length > 0) {
+      for (let i = result.tools.length - 1; i >= 0; i--) {
+        if (!result.tools[i].defer_loading) {
+          result.tools[i].cache_control = { type: "ephemeral", ttl: "1h" };
+          break;
+        }
       }
     }
   }
@@ -432,8 +425,6 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
   }
 
   // response_format: inject JSON structured output instruction into system prompt.
-  // Claude doesn't natively support response_format, so we insert a system-level instruction.
-  // NOTE: systemParts are consumed later (after this block) — they're accumulated here.
   if (body.response_format) {
     const fmt = body.response_format;
     if (fmt.type === "json_schema" && fmt.json_schema?.schema) {
@@ -448,29 +439,60 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
     }
   }
 
-  // System messages and cache_control
-  // Fix #2130: Preserve body.system when present (Claude Code sends system as native
-  // Anthropic array through the /chat/completions endpoint). Without this, the system
-  // prompt is silently dropped when no role="system" messages exist in body.messages.
+  // System messages and cache_control — merge all system parts into 1 text block
   if (systemParts.length > 0) {
-    const systemText = systemParts.join("\n");
+    const systemText = systemParts.join("\n\n");
     const systemBlock = {
       type: "text",
       text: systemText,
       cache_control: { type: "ephemeral", ttl: "1h" },
     };
-    // Merge with existing body.system if present
     if (Array.isArray(body.system)) {
-      result.system = [...body.system, systemBlock];
+      const existingText = body.system
+        .map((s: unknown) =>
+          typeof s === "string"
+            ? s
+            : typeof s === "object" && s !== null
+              ? (s as Record<string, unknown>).text || ""
+              : ""
+        )
+        .filter(Boolean)
+        .join("\n\n");
+      result.system = [
+        {
+          type: "text",
+          text: [existingText, systemText].filter(Boolean).join("\n\n"),
+          cache_control: { type: "ephemeral", ttl: "1h" },
+        },
+      ];
     } else if (typeof body.system === "string" && body.system.length > 0) {
-      result.system = [{ type: "text", text: body.system }, systemBlock];
+      result.system = [
+        {
+          type: "text",
+          text: body.system + "\n\n" + systemText,
+          cache_control: { type: "ephemeral", ttl: "1h" },
+        },
+      ];
     } else {
       result.system = [systemBlock];
     }
   } else if (body.system) {
-    // No role="system" messages, but body.system exists — pass through as-is
     result.system = Array.isArray(body.system)
-      ? body.system
+      ? [
+          {
+            type: "text",
+            text: body.system
+              .map((s: unknown) =>
+                typeof s === "string"
+                  ? s
+                  : typeof s === "object" && s !== null
+                    ? (s as Record<string, unknown>).text || ""
+                    : ""
+              )
+              .filter(Boolean)
+              .join("\n\n"),
+          },
+        ]
       : [{ type: "text", text: String(body.system) }];
   }
 
@@ -479,16 +501,12 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
     result._toolNameMap = toolNameMap;
   }
 
-  // Empty-messages guard. Claude's Messages API rejects an empty `messages`
-  // array with `400 messages: at least one message is required`. This happens
-  // when the incoming OpenAI request carried only `system`/`developer` turns
-  // (e.g. an all-system compaction or title-generation request from a client
-  // like OpenCode): those are hoisted into `result.system` above, leaving
-  // `messages` empty. Synthesize a minimal user turn so the request stays
-  // valid — the system instructions still drive the response. (#5245)
   if (result.messages.length === 0) {
     result.messages.push({ role: "user", content: [{ type: "text", text: "." }] });
   }
+
+  cleanEmptyFields(result);
+  logPayloadStats(result);
 
   return result;
 }

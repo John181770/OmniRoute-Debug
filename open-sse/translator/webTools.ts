@@ -1,4 +1,5 @@
 // Tool-call translation for web-cookie providers (deepseek-web, chatgpt-web, ...).
+import { detectRequiredTools, mergeSystemPrompts } from "./helpers/toolOptimizer.ts";
 //
 // The web UIs accept only a single plain prompt string and have no native function
 // calling — they reply with tool invocations as raw text. To let agentic clients use
@@ -489,15 +490,29 @@ export function prepareToolMessages(
   bodyObj: Record<string, unknown>,
   messages: Array<{ role: string; content: unknown }>
 ): ToolPrepResult {
-  const requestedTools = bodyObj.tools;
-  const hasTools = Array.isArray(requestedTools) && requestedTools.length > 0;
-  if (!hasTools) return { hasTools: false, requestedTools, effectiveMessages: messages };
+  const rawTools = bodyObj.tools;
+  const filteredTools = Array.isArray(rawTools)
+    ? detectRequiredTools(
+        messages as Record<string, unknown>[],
+        rawTools as Record<string, unknown>[],
+        bodyObj.tool_choice
+      )
+    : [];
 
-  const toolPrompt = serializeToolsToPrompt(requestedTools);
+  if (filteredTools.length === 0) {
+    return { hasTools: false, requestedTools: [], effectiveMessages: messages };
+  }
+
+  const toolPrompt = serializeToolsToPrompt(filteredTools);
+  const effectiveMessages = mergeSystemPrompts([
+    { role: "system", content: toolPrompt },
+    ...messages,
+  ]) as Array<{ role: string; content: unknown }>;
+
   return {
     hasTools: true,
-    requestedTools,
-    effectiveMessages: [{ role: "system", content: toolPrompt }, ...messages],
+    requestedTools: filteredTools,
+    effectiveMessages,
   };
 }
 

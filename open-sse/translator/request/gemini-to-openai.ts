@@ -1,6 +1,15 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 import { adjustMaxTokens } from "../helpers/maxTokensHelper.ts";
+import {
+  compressToolDescription,
+  compressSchema,
+  deduplicateTools,
+  detectRequiredTools,
+  mergeSystemPrompts,
+  cleanEmptyFields,
+  logPayloadStats,
+} from "../helpers/toolOptimizer.ts";
 
 // Convert Gemini request to OpenAI format
 export function geminiToOpenAIRequest(model, body, stream) {
@@ -64,14 +73,21 @@ export function geminiToOpenAIRequest(model, body, stream) {
             type: "function",
             function: {
               name: func.name,
-              description: func.description || "",
-              parameters: func.parameters || { type: "object", properties: {} },
+              description: compressToolDescription(func.description),
+              parameters: compressSchema(func.parameters),
             },
           });
         }
       }
     }
   }
+
+  result.messages = mergeSystemPrompts(result.messages);
+  if (result.tools && result.tools.length > 0) {
+    result.tools = detectRequiredTools(result.messages, result.tools);
+  }
+  cleanEmptyFields(result);
+  logPayloadStats(result);
 
   return result;
 }

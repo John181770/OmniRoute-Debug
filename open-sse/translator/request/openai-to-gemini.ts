@@ -2,6 +2,14 @@ import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 import { ANTIGRAVITY_DEFAULT_SYSTEM } from "../../config/constants.ts";
 import {
+  compressToolDescription,
+  compressSchema,
+  deduplicateTools,
+  detectRequiredTools,
+  cleanEmptyFields,
+  logPayloadStats,
+} from "../helpers/toolOptimizer.ts";
+import {
   buildGeminiThoughtSignatureKey,
   resolveGeminiThoughtSignature,
 } from "../../services/geminiThoughtSignatureStore.ts";
@@ -586,7 +594,10 @@ function openaiToGeminiBase(
 
   // Convert tools
   const bodyTools = body.tools as Array<Record<string, unknown>> | undefined;
-  const geminiTools = buildGeminiTools(bodyTools, {
+  const filteredBodyTools = bodyTools
+    ? detectRequiredTools(body.messages as Record<string, unknown>[], bodyTools, body.tool_choice)
+    : undefined;
+  const geminiTools = buildGeminiTools(filteredBodyTools, {
     ...toolNameOptions,
     toolNameMap,
   });
@@ -736,7 +747,11 @@ function wrapInCloudCodeEnvelope(model, cloudCodeRequest, credentials = null) {
 
   const defaultPart: GeminiPart = { text: ANTIGRAVITY_DEFAULT_SYSTEM };
   if (envelope.request.systemInstruction?.parts) {
-    envelope.request.systemInstruction.parts.unshift(defaultPart);
+    const combinedPartsText = [
+      defaultPart.text,
+      ...envelope.request.systemInstruction.parts.map((p) => p.text || "").filter(Boolean),
+    ].join("\n\n");
+    envelope.request.systemInstruction = { role: "system", parts: [{ text: combinedPartsText }] };
   } else {
     envelope.request.systemInstruction = { role: "system", parts: [defaultPart] };
   }

@@ -513,8 +513,6 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
   }
 
   // Reasoning effort: map Claude-side thinking controls to OpenAI reasoning_effort.
-  // Priority: output_config.effort (Claude Code) > thinking.budget_tokens (Claude native).
-  // Budget buckets match the reverse mapping in thinkingBudget.ts::setCustomBudget.
   const outputEffort = normalizeOpenAIReasoningEffort(body.output_config?.effort) || "";
   if (outputEffort) {
     result.reasoning_effort = outputEffort;
@@ -533,31 +531,9 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
     }
   }
 
-  // Remove Empty Request Fields (Task 8 & Task 9)
-  if (!result.tools || (Array.isArray(result.tools) && result.tools.length === 0)) {
-    delete result.tools;
-    delete result.tool_choice;
-  }
-  if (!result.tool_choice) {
-    delete result.tool_choice;
-  }
-  if (!result.stop || (Array.isArray(result.stop) && result.stop.length === 0)) {
-    delete result.stop;
-  }
-
-  const payload = JSON.stringify(result);
-
-  // Instrumentation (Task 10)
-  const systemCount = result.messages.filter((m) => m.role === "system").length;
-  const toolCount = Array.isArray(result.tools) ? (result.tools as unknown[]).length : 0;
-
-  console.log("\n===== Payload Stats =====");
-  console.log("System:", systemCount);
-  console.log("Tools:", toolCount);
-  console.log("Messages:", result.messages.length);
-  console.log("Payload:", payload.length);
-  console.log("Approx Tokens:", Math.ceil(payload.length / 4));
-  console.log("================================\n");
+  result.messages = mergeSystemPrompts(result.messages);
+  cleanEmptyFields(result);
+  logPayloadStats(result);
 
   return result;
 }
