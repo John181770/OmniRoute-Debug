@@ -54,8 +54,6 @@ function keepOpaqueObjectSchemasOpen(schema: JsonRecord): void {
   if (properties === undefined) {
     schema.properties = {};
     schema.additionalProperties = true;
-  } else if (isPlainObject(properties) && Object.keys(properties).length === 0) {
-    schema.additionalProperties = true;
   }
 }
 
@@ -87,6 +85,12 @@ export function coerceSchemaNumericFields(schema: unknown): unknown {
   if (!isPlainObject(schema)) return schema;
 
   const result: JsonRecord = { ...schema };
+
+  // Strip non-functional JSON Schema metadata fields to minimize payload token size
+  if ("title" in result) delete result.title;
+  if ("$schema" in result) delete result.$schema;
+  if ("$comment" in result) delete result.$comment;
+  if ("examples" in result) delete result.examples;
 
   // Fix #1782: Strip 'default' property to prevent upstream models from eagerly injecting optional fields
   if ("default" in result) {
@@ -256,8 +260,28 @@ export function sanitizeToolDescription(tool: unknown): unknown {
 export function coerceToolSchemas(tools: unknown): unknown {
   if (!Array.isArray(tools)) return tools;
 
-  return tools.map((tool) => {
-    if (!isPlainObject(tool)) return tool;
+  const seenNames = new Set<string>();
+  const deduplicatedTools: unknown[] = [];
+
+  for (const tool of tools) {
+    if (!isPlainObject(tool)) {
+      deduplicatedTools.push(tool);
+      continue;
+    }
+
+    const toolName =
+      (isPlainObject(tool.function) &&
+        typeof tool.function.name === "string" &&
+        tool.function.name) ||
+      (typeof tool.name === "string" && tool.name) ||
+      "";
+
+    if (toolName && seenNames.has(toolName)) {
+      continue;
+    }
+    if (toolName) {
+      seenNames.add(toolName);
+    }
 
     const result: JsonRecord = { ...tool };
 
@@ -286,8 +310,10 @@ export function coerceToolSchemas(tools: unknown): unknown {
       });
     }
 
-    return result;
-  });
+    deduplicatedTools.push(result);
+  }
+
+  return deduplicatedTools;
 }
 
 // #7023 — Responses API strict mode forces every "optional" tool property into
@@ -299,7 +325,11 @@ export function coerceToolSchemas(tools: unknown): unknown {
 // `null` (see pureHelpers.ts::isDroppableNullEntry). Scope: top-level
 // `properties[key].enum` only — does not recurse into `items`/`anyOf`/`oneOf` branches
 // (no real-world case beyond Agent.isolation is documented; extend with a concrete repro).
-function shouldInjectNullOmission(key: string, propSchema: unknown, required: Set<string>): boolean {
+function shouldInjectNullOmission(
+  key: string,
+  propSchema: unknown,
+  required: Set<string>
+): boolean {
   return (
     isPlainObject(propSchema) &&
     Array.isArray(propSchema.enum) &&

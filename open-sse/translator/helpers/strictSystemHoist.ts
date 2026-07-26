@@ -7,7 +7,9 @@ function toTextContent(content: unknown): string {
   if (Array.isArray(content)) {
     return content
       .filter((part): part is { type: string; text?: unknown } => {
-        return Boolean(part) && typeof part === "object" && (part as { type?: unknown }).type === "text";
+        return (
+          Boolean(part) && typeof part === "object" && (part as { type?: unknown }).type === "text"
+        );
       })
       .map((part) => String(part.text ?? ""))
       .join("\n");
@@ -49,12 +51,21 @@ export function hoistLeadingSystemMessage(
   const offending = offendingIndices.map((i) => messages[i]);
   const rest = messages.filter((_, i) => !offendingIndices.includes(i));
 
-  const mergedText = [
+  const rawTexts = [
     rest[0]?.role === "system" ? toTextContent(rest[0].content) : null,
     ...offending.map((m) => toTextContent(m.content)),
-  ]
-    .filter((text): text is string => Boolean(text))
-    .join("\n");
+  ].filter((text): text is string => Boolean(text));
+
+  const uniqueTexts: string[] = [];
+  const seen = new Set<string>();
+  for (const text of rawTexts) {
+    const trimmed = text.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      uniqueTexts.push(trimmed);
+    }
+  }
+  const mergedText = uniqueTexts.join("\n\n");
 
   if (rest[0]?.role === "system") {
     const mergedFirst: Message = { ...rest[0], content: mergedText };

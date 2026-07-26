@@ -1,6 +1,7 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 import { adjustMaxTokens } from "../helpers/maxTokensHelper.ts";
+import { coerceSchemaNumericFields } from "../helpers/schemaCoercion.ts";
 
 type JsonRecord = Record<string, unknown>;
 const TOOL_CHOICE_ANY = ["a", "n", "y"].join("");
@@ -130,35 +131,54 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
 
   // System message
   if (body.system) {
-    // When preserving cache_control for a caching-capable provider, and the client
-    // tagged any system block, keep the array-of-blocks shape so the breakpoint
-    // survives (DashScope reads cache_control off content blocks). Otherwise fall
-    // back to the joined-string form expected by generic OpenAI providers (#2069).
     const systemHasCacheControl =
       preserveCacheControl &&
       Array.isArray(body.system) &&
       body.system.some((s) => s && typeof s === "object" && s.cache_control !== undefined);
 
-    const systemContent = systemHasCacheControl
-      ? body.system.map((s) => {
-          // body.system may be a mixed array — handle string elements (and
-          // null/non-object) defensively so we never drop text or throw.
-          if (typeof s === "string") return { type: "text", text: stripAnthropicBillingHeader(s) };
+    let systemContent: unknown;
+    if (systemHasCacheControl) {
+      const seenTexts = new Set<string>();
+      systemContent = body.system
+        .map((s) => {
+          if (typeof s === "string") {
+            const text = stripAnthropicBillingHeader(s).trim();
+            if (!text || seenTexts.has(text)) return null;
+            seenTexts.add(text);
+            return { type: "text", text };
+          }
           const rawText = s && typeof s === "object" ? (s as JsonRecord).text || "" : "";
-          const block: JsonRecord = { type: "text", text: stripAnthropicBillingHeader(rawText) };
+          const text = stripAnthropicBillingHeader(rawText).trim();
+          if (!text || seenTexts.has(text)) return null;
+          seenTexts.add(text);
+          const block: JsonRecord = { type: "text", text };
           if (s && typeof s === "object" && (s as JsonRecord).cache_control !== undefined) {
             block.cache_control = (s as JsonRecord).cache_control;
           }
           return block;
         })
-      : Array.isArray(body.system)
-        ? body.system
-            .map((s) => stripAnthropicBillingHeader(s.text || ""))
-            .filter(Boolean)
-            .join("\n")
-        : stripAnthropicBillingHeader(body.system);
+        .filter(Boolean);
+    } else {
+      const rawList = Array.isArray(body.system) ? body.system : [body.system];
+      const uniqueTexts: string[] = [];
+      const seen = new Set<string>();
+      for (const s of rawList) {
+        const raw = typeof s === "string" ? s : s?.text || "";
+        const cleaned = stripAnthropicBillingHeader(raw).trim();
+        if (cleaned && !seen.has(cleaned)) {
+          seen.add(cleaned);
+          uniqueTexts.push(cleaned);
+        }
+      }
+      systemContent = uniqueTexts.join("\n");
+    }
 
-    if (systemHasCacheControl || systemContent) {
+    if (
+      systemHasCacheControl ||
+      (typeof systemContent === "string"
+        ? Boolean(systemContent)
+        : Array.isArray(systemContent) && systemContent.length > 0)
+    ) {
       result.messages.push({
         role: "system",
         content: systemContent,
@@ -182,30 +202,48 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
     }
   }
 
+  // Deduplicate images in historical turns (preserves full image on current/latest turn)
+  result.messages = deduplicateAndOptimizeImages(result.messages);
+
   // #4714 / #4385: re-group every role:"tool" message immediately after the
   // assistant turn whose tool_calls issued it (dropping genuine orphans), then
   // fill placeholders for any tool_call left unanswered.
   result.messages = regroupToolMessages(result.messages);
 
+  // Merge adjacent turns of same role & remove empty content turns
+  result.messages = mergeAdjacentAndRemoveEmpty(result.messages);
+
   // Fix missing tool responses - OpenAI requires every tool_call to have a response.
   // Runs after regrouping so real results are already adjacent and only a truly
-  // unanswered tool_call receives a "[No response received]" placeholder.
+  // unanswered tool_call receives a placeholder.
   fixMissingToolResponses(result.messages);
 
   const useNativeResponsesWebSearch = shouldUseNativeResponsesWebSearch(credentials);
 
   // Tools
   if (body.tools && Array.isArray(body.tools)) {
+    const seenToolNames = new Set<string>();
     const normalizedTools = body.tools
       .map((tool) => {
-        if (useNativeResponsesWebSearch && isClaudeServerWebSearchTool(tool)) {
-          return convertClaudeServerWebSearchTool(tool);
+        if (isClaudeServerWebSearchTool(tool)) {
+          if (useNativeResponsesWebSearch) {
+            return convertClaudeServerWebSearchTool(tool);
+          }
+          return {
+            type: "function",
+            function: {
+              name: "web_search",
+              description: "",
+              parameters: { type: "object", properties: {}, additionalProperties: true },
+            },
+          };
         }
 
         if (!tool || typeof tool !== "object" || Array.isArray(tool)) return null;
         const record = tool as JsonRecord;
         const name = typeof record.name === "string" ? record.name.trim() : "";
-        if (!name) return null; // skip tools with empty/invalid name
+        if (!name || seenToolNames.has(name)) return null; // skip duplicate or empty name
+        seenToolNames.add(name);
 
         return {
           type: "function",
@@ -252,16 +290,195 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
     }
   }
 
+  // Clean unused empty optional arrays/properties
+  if (Array.isArray(result.tools) && result.tools.length === 0) {
+    delete result.tools;
+  }
+  if (Array.isArray(result.stop) && result.stop.length === 0) {
+    delete result.stop;
+  }
+
   const payload = JSON.stringify(result);
 
-console.log("\n===== OpenAI Payload Stats =====");
-console.log("System Messages:", result.messages.filter(m => m.role === "system").length);
-console.log("Tools:", result.tools?.length ?? 0);
-console.log("Payload Size:", payload.length, "bytes");
-console.log("Approx Tokens:", Math.ceil(payload.length / 4));
-console.log("================================\n");
+  console.log("\n===== OpenAI Payload Stats =====");
+  console.log("System Messages:", result.messages.filter((m) => m.role === "system").length);
+  console.log("Tools:", result.tools?.length ?? 0);
+  console.log("Payload Size:", payload.length, "bytes");
+  console.log("Approx Tokens:", Math.ceil(payload.length / 4));
+  console.log("================================\n");
 
-return result;
+  return result;
+}
+
+function getImageFingerprint(url: string): string {
+  if (!url || typeof url !== "string") return "";
+  const commaIdx = url.indexOf(",");
+  if (commaIdx !== -1 && url.startsWith("data:image/")) {
+    const b64 = url.slice(commaIdx + 1).trim();
+    if (b64.length > 100) {
+      return `b64_${b64.length}_${b64.slice(0, 32)}_${b64.slice(-32)}`;
+    }
+  }
+  return url;
+}
+
+function deduplicateAndOptimizeImages(messages: JsonRecord[]): JsonRecord[] {
+  const lastIndexMap = new Map<string, number>();
+
+  messages.forEach((msg, idx) => {
+    if (Array.isArray(msg.content)) {
+      for (const part of msg.content as JsonRecord[]) {
+        if (part?.type === "image_url" && part.image_url && typeof part.image_url === "object") {
+          const url = (part.image_url as JsonRecord).url;
+          if (typeof url === "string" && url.length > 100) {
+            const fp = getImageFingerprint(url);
+            lastIndexMap.set(fp, idx);
+          }
+        }
+      }
+    }
+  });
+
+  return messages.map((msg, idx) => {
+    if (!Array.isArray(msg.content)) return msg;
+    const newContent: JsonRecord[] = [];
+    const seenFingerprintsInTurn = new Set<string>();
+
+    for (const part of msg.content as JsonRecord[]) {
+      if (part?.type === "image_url" && part.image_url && typeof part.image_url === "object") {
+        const url = (part.image_url as JsonRecord).url;
+        if (typeof url === "string" && url.length > 100) {
+          const fp = getImageFingerprint(url);
+          const lastIdx = lastIndexMap.get(fp);
+          if ((lastIdx !== undefined && lastIdx > idx) || idx < messages.length - 1) {
+            newContent.push({
+              type: "text",
+              text: "[Prior attached image retained in context]",
+            });
+            continue;
+          }
+          if (seenFingerprintsInTurn.has(fp)) {
+            newContent.push({
+              type: "text",
+              text: "[Duplicate attached image retained in context]",
+            });
+            continue;
+          }
+          seenFingerprintsInTurn.add(fp);
+        }
+      }
+      newContent.push(part);
+    }
+
+    const collapsedContent: JsonRecord[] = [];
+    for (const item of newContent) {
+      if (
+        item.type === "text" &&
+        collapsedContent.length > 0 &&
+        collapsedContent[collapsedContent.length - 1].type === "text"
+      ) {
+        collapsedContent[collapsedContent.length - 1].text += "\n" + item.text;
+      } else {
+        collapsedContent.push(item);
+      }
+    }
+
+    return {
+      ...msg,
+      content:
+        collapsedContent.length === 1 && collapsedContent[0].type === "text"
+          ? collapsedContent[0].text
+          : collapsedContent,
+    };
+  });
+}
+
+function mergeAdjacentAndRemoveEmpty(messages: JsonRecord[]): JsonRecord[] {
+  const filtered: JsonRecord[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    const isFinalAssistant = i === messages.length - 1 && msg.role === "assistant";
+    const hasReasoning = "reasoning_content" in msg && msg.reasoning_content !== null;
+    if (
+      !isFinalAssistant &&
+      (msg.role === "user" || msg.role === "assistant") &&
+      !msg.tool_calls &&
+      !hasReasoning &&
+      !msg.tool_call_id
+    ) {
+      if (typeof msg.content === "string" && msg.content.trim() === "") continue;
+      if (Array.isArray(msg.content) && msg.content.length === 0) continue;
+    }
+    filtered.push(msg);
+  }
+
+  const merged: JsonRecord[] = [];
+  for (const msg of filtered) {
+    const prev = merged[merged.length - 1];
+    if (
+      prev &&
+      prev.role === "user" &&
+      msg.role === "user" &&
+      !prev.tool_calls &&
+      !msg.tool_calls &&
+      !prev.tool_call_id &&
+      !msg.tool_call_id
+    ) {
+      const prevContent =
+        typeof prev.content === "string"
+          ? [{ type: "text", text: prev.content }]
+          : Array.isArray(prev.content)
+            ? prev.content
+            : [];
+      const msgContent =
+        typeof msg.content === "string"
+          ? [{ type: "text", text: msg.content }]
+          : Array.isArray(msg.content)
+            ? msg.content
+            : [];
+      const combined = [...prevContent, ...msgContent];
+
+      if (combined.every((p) => p.type === "text")) {
+        prev.content = combined.map((p) => p.text).join("\n");
+      } else {
+        prev.content = combined;
+      }
+      continue;
+    }
+
+    const prevHasReasoning = prev && "reasoning_content" in prev && prev.reasoning_content !== null;
+    const msgHasReasoning = "reasoning_content" in msg && msg.reasoning_content !== null;
+
+    if (
+      prev &&
+      prev.role === "assistant" &&
+      msg.role === "assistant" &&
+      !prev.tool_calls &&
+      !msg.tool_calls &&
+      !prevHasReasoning &&
+      !msgHasReasoning
+    ) {
+      const prevContent =
+        typeof prev.content === "string"
+          ? prev.content
+          : Array.isArray(prev.content)
+            ? (prev.content as JsonRecord[]).map((p) => p.text || "").join("\n")
+            : "";
+      const msgContent =
+        typeof msg.content === "string"
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? (msg.content as JsonRecord[]).map((p) => p.text || "").join("\n")
+            : "";
+      prev.content = [prevContent, msgContent].filter(Boolean).join("\n");
+      continue;
+    }
+
+    merged.push(msg);
+  }
+
+  return merged;
 }
 
 // #4714: Re-group tool result messages so every role:"tool" message sits
